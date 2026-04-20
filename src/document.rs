@@ -4171,6 +4171,11 @@ impl PdfDocument {
                 // vertically centred across several dense-column data rows)
                 // to sort at the top of their row block.
                 Self::reorder_rowspan_labels(&mut spans);
+
+                // Restore intra-line reading order after the row-aware band sort.
+                // Off-baseline glyphs (e.g. superscripts/subscripts) can land in
+                // adjacent bands and be emitted out of X order; fix that per line.
+                Self::reorder_same_line_runs(&mut spans);
             }
 
             // OCR fallback for scanned PDFs
@@ -5161,6 +5166,42 @@ impl PdfDocument {
     /// absolute tolerance.
     fn same_line_threshold(prev: &TextSpan, current: &TextSpan) -> f32 {
         prev.font_size.max(current.font_size).max(1.0) * 0.5
+    }
+
+    /// Re-sort same-line spans by X after row-aware band sorting.
+    ///
+    /// Finds maximal runs where spans are within `same_line_threshold`
+    /// and sorts each run by X (stable via `sequence`). This corrects
+    /// ordering for mixed-baseline glyphs (e.g. superscripts) without
+    /// affecting line grouping.
+    pub(crate) fn reorder_same_line_runs(spans: &mut [TextSpan]) {
+        let mut i = 0;
+        while i < spans.len() {
+            let mut j = i + 1;
+            while j < spans.len() {
+                let anchor = &spans[i];
+                let prev = &spans[j - 1];
+                let cur = &spans[j];
+                let to_prev = (cur.bbox.y - prev.bbox.y).abs();
+                let to_anchor = (cur.bbox.y - anchor.bbox.y).abs();
+                let tol_prev = Self::same_line_threshold(prev, cur);
+                let tol_anchor = Self::same_line_threshold(anchor, cur);
+                if to_prev > tol_prev || to_anchor > tol_anchor {
+                    break;
+                }
+                j += 1;
+            }
+            if j - i > 1 {
+                spans[i..j].sort_by(|a, b| {
+                    let cmp = crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                    a.sequence.cmp(&b.sequence)
+                });
+            }
+            i = j;
+        }
     }
 
     /// # Returns

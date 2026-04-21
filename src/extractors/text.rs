@@ -2023,6 +2023,71 @@ pub struct TextExtractor {
     cached_current_font: Option<Arc<FontInfo>>,
 }
 
+/// Absolute PDF-space epsilon for interposition checks.
+///
+/// Kept absolute rather than font-relative because bbox jitter does not
+/// scale with font size.
+const INTERPOSE_EPS_PT: f32 = 0.25;
+
+/// Minimal geometry view used by `would_interpose_glyph`.
+///
+/// Built once from the pre-merge span list and sorted by Y so the guard
+/// can binary-search the candidate window.
+#[derive(Clone, Copy)]
+struct InterposeCandidate {
+    x_left: f32,
+    x_right: f32,
+    y: f32,
+    font_size: f32,
+    sequence: usize,
+    is_whitespace: bool,
+}
+
+/// Returns true if a non-whitespace span other than the two merge
+/// candidates overlaps the open X interval `(merge_left, merge_right)`
+/// and is close enough in Y to count as on the same line.
+fn would_interpose_glyph(
+    y_index: &[InterposeCandidate],
+    page_max_fs: f32,
+    merge_left: f32,
+    merge_right: f32,
+    baseline_y: f32,
+    baseline_fs: f32,
+    exclude_seq_a: usize,
+    exclude_seq_b: usize,
+) -> bool {
+    // No interior corridor.
+    if merge_right <= merge_left + 2.0 * INTERPOSE_EPS_PT {
+        return false;
+    }
+
+    let y_window = page_max_fs.max(baseline_fs).max(1.0) * 0.5 + INTERPOSE_EPS_PT;
+    let y_low = baseline_y - y_window;
+    let y_high = baseline_y + y_window;
+
+    let start = y_index.partition_point(|c| c.y < y_low);
+    let end = y_index.partition_point(|c| c.y <= y_high);
+
+    for g in &y_index[start..end] {
+        if g.sequence == exclude_seq_a || g.sequence == exclude_seq_b {
+            continue;
+        }
+        if g.is_whitespace {
+            continue;
+        }
+        let x_overlaps =
+            g.x_right > merge_left + INTERPOSE_EPS_PT && g.x_left < merge_right - INTERPOSE_EPS_PT;
+        if !x_overlaps {
+            continue;
+        }
+        let line_tol = baseline_fs.max(g.font_size).max(1.0) * 0.5;
+        if (g.y - baseline_y).abs() <= line_tol + INTERPOSE_EPS_PT {
+            return true;
+        }
+    }
+    false
+}
+
 impl TextExtractor {
     /// Fraction of a glyph's advance width considered "overlap" for
     /// duplicate detection. Used by both `deduplicate_overlapping_chars`
@@ -3210,6 +3275,24 @@ impl TextExtractor {
             return;
         }
 
+        // Build a Y-sorted geometry snapshot of the pre-merge spans for
+        // the interposition guard. The merge loop mutates `current_span`,
+        // but guard lookups always read from this stable view.
+        let mut y_index: Vec<InterposeCandidate> = self
+            .spans
+            .iter()
+            .map(|s| InterposeCandidate {
+                x_left: s.bbox.x,
+                x_right: s.bbox.x + s.bbox.width,
+                y: s.bbox.y,
+                font_size: s.font_size,
+                sequence: s.sequence,
+                is_whitespace: s.text.chars().all(|c| c.is_whitespace()),
+            })
+            .collect();
+        y_index.sort_by(|a, b| crate::utils::safe_float_cmp(a.y, b.y));
+        let page_max_fs = y_index.iter().map(|c| c.font_size).fold(0.0_f32, f32::max);
+
         // Take ownership of spans to avoid cloning during iteration
         let old_len = self.spans.len();
         let spans = std::mem::take(&mut self.spans);
@@ -3303,25 +3386,6 @@ impl TextExtractor {
                 && current.font_weight == span.font_weight
                 && current.is_italic == span.is_italic;
 
-            // Cross-font word glue: same-baseline spans in different
-            // fonts/weights, tight gap (<0.25em), both sides alphabetic,
-            // and one side is a single character. Targets the drop-cap /
-            // single-letter-small-caps typography pattern where per-
-            // letter emphasis runs would corrupt proper nouns.
-            let cross_font_word_glue = !is_same_font
-                && same_line
-                && gap > -1.0
-                && gap < font_size_ref * 0.25
-                && !current.text.is_empty()
-                && !span.text.is_empty()
-                && current
-                    .text
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_alphabetic())
-                && span.text.chars().next().is_some_and(|c| c.is_alphabetic())
-                && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
-
             // Merge threshold: Use configured values
             // Negative gaps: use severe_overlap_threshold_pt (default -0.5pt)
             // Positive gaps: use a threshold that allows for justified text but
@@ -3335,19 +3399,49 @@ impl TextExtractor {
                 0.5
             };
 
-            let should_merge = same_line
+            // Refuse merges across an interposed glyph in the X corridor.
+            // Split-boundary glue stays ungated.
+            let interposed = would_interpose_glyph(
+                &y_index,
+                page_max_fs,
+                current_end_x,
+                span.bbox.x,
+                current.bbox.y,
+                font_size_ref,
+                current.sequence,
+                span.sequence,
+            );
+
+            // Same-font word reconstruction.
+            let same_font_merge = same_line
                 && is_same_font
                 && (self.merging_config.severe_overlap_threshold_pt..merge_threshold_pt)
                     .contains(&gap)
                 && !large_gap_indicates_column
-                || (same_line && has_split_boundary)
-                || cross_font_word_glue;
+                && !interposed;
 
-            // DECIMAL VALUE MERGE: Some forms place integer and decimal parts
-            // of dollar amounts in separate fixed-width boxes.
-            // e.g., "123456" (integer box) + "72" (cents box) with ~10pt gap.
-            // Detect this pattern: both spans are pure digits, the second is
-            // exactly 1-2 digits (cents), same line, and gap < 2x font size.
+            // Split-boundary glue stays ungated.
+            let split_boundary_merge = same_line && has_split_boundary;
+
+            // Cross-font word reconstruction for drop-cap / emphasis runs.
+            let cross_font_merge = !is_same_font
+                && same_line
+                && gap > -1.0
+                && gap < font_size_ref * 0.25
+                && !current.text.is_empty()
+                && !span.text.is_empty()
+                && current
+                    .text
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphabetic())
+                && span.text.chars().next().is_some_and(|c| c.is_alphabetic())
+                && (current.text.chars().count() == 1 || span.text.chars().count() == 1)
+                && !interposed;
+
+            let should_merge = same_font_merge || split_boundary_merge || cross_font_merge;
+
+            // Decimal value merge for split integer / cents fields.
             let decimal_merge = same_line
                 && gap > 0.0
                 && gap < current.font_size * 2.0
@@ -3355,7 +3449,8 @@ impl TextExtractor {
                 && !span.text.is_empty()
                 && current.text.chars().all(|c| c.is_ascii_digit())
                 && span.text.chars().all(|c| c.is_ascii_digit())
-                && (1..=2).contains(&span.text.len());
+                && (1..=2).contains(&span.text.len())
+                && !interposed;
 
             if decimal_merge {
                 // Join integer and decimal parts with "."
@@ -3369,7 +3464,7 @@ impl TextExtractor {
                 );
                 current.text.push('.');
                 current.text.push_str(&span.text);
-            } else if cross_font_word_glue {
+            } else if cross_font_merge {
                 // Mid-word font/weight change: concatenate without any space
                 // or space-heuristic — these are same-word character runs.
                 current.text.push_str(&span.text);
@@ -3451,8 +3546,8 @@ impl TextExtractor {
                 }
             }
 
-            if decimal_merge || should_merge || cross_font_word_glue {
-                // Extend bounding box to include both spans
+            if decimal_merge || should_merge {
+                // Extend bounding box to include both spans.
                 let new_width = (span.bbox.x + span.bbox.width) - current.bbox.x;
                 let new_height = current.bbox.height.max(span.bbox.height);
 
@@ -3463,7 +3558,7 @@ impl TextExtractor {
                 // metadata. The single-letter side was typographic
                 // decoration, not semantic emphasis, so the dominant-run
                 // style should win.
-                if cross_font_word_glue {
+                if cross_font_merge {
                     let span_chars = span.text.chars().count();
                     let current_chars_before = current.text.chars().count() - span_chars;
                     if span_chars > current_chars_before {
@@ -13269,5 +13364,118 @@ mod profile_based_space_tests {
         assert_eq!(extractor.spans[0].text, "Sales");
         // Dominant-font swap: the longer run (regular weight) should win.
         assert_eq!(extractor.spans[0].font_weight, FontWeight::Normal);
+    }
+}
+
+// Boundary tests for `would_interpose_glyph`.
+#[cfg(test)]
+mod interpose_guard_boundary_tests {
+    use super::*;
+
+    fn mk(
+        x_left: f32,
+        x_right: f32,
+        y: f32,
+        font_size: f32,
+        sequence: usize,
+    ) -> InterposeCandidate {
+        InterposeCandidate {
+            x_left,
+            x_right,
+            y,
+            font_size,
+            sequence,
+            is_whitespace: false,
+        }
+    }
+
+    fn y_sort(mut v: Vec<InterposeCandidate>) -> Vec<InterposeCandidate> {
+        v.sort_by(|a, b| crate::utils::safe_float_cmp(a.y, b.y));
+        v
+    }
+
+    #[test]
+    fn interposer_touches_left_edge_only_does_not_block() {
+        // Right edge touches `merge_left` but does not enter the corridor.
+        let view = y_sort(vec![mk(100.0, 110.0, 200.0, 12.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn interposer_touches_right_edge_only_does_not_block() {
+        // Left edge touches `merge_right` but does not enter the corridor.
+        let view = y_sort(vec![mk(120.0, 130.0, 200.0, 12.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn interposer_overlap_below_eps_does_not_block() {
+        // Overlap smaller than `INTERPOSE_EPS_PT` is ignored.
+        let view = y_sort(vec![mk(109.9, 110.1, 200.0, 12.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn interposer_overlap_above_eps_blocks() {
+        // Real X-overlap inside the corridor should block.
+        let view = y_sort(vec![mk(109.0, 111.0, 198.0, 12.0, 7)]);
+        assert!(would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn interposer_wholly_outside_corridor_does_not_block() {
+        // Candidates outside the corridor should be ignored.
+        let view = y_sort(vec![
+            mk(50.0, 60.0, 200.0, 12.0, 7),
+            mk(200.0, 210.0, 200.0, 12.0, 8),
+        ]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn y_at_threshold_plus_eps_still_blocks() {
+        // Inclusive epsilon on Y should still treat this as same-line.
+        let view = y_sort(vec![mk(112.0, 118.0, 193.9, 12.0, 7)]);
+        assert!(would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn y_beyond_threshold_plus_eps_does_not_block() {
+        // Outside the Y tolerance window should not block.
+        let view = y_sort(vec![mk(112.0, 118.0, 193.0, 12.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn whitespace_only_interposer_does_not_block() {
+        // Whitespace spans are ignored.
+        let mut w = mk(112.0, 118.0, 200.0, 12.0, 7);
+        w.is_whitespace = true;
+        let view = y_sort(vec![w]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn excluded_sequence_numbers_do_not_self_block() {
+        // The two merge candidates themselves must be ignored.
+        let view = y_sort(vec![
+            mk(112.0, 118.0, 200.0, 12.0, 1),
+            mk(112.0, 118.0, 200.0, 12.0, 2),
+        ]);
+        assert!(!would_interpose_glyph(&view, 12.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn degenerate_corridor_does_not_block() {
+        // No open interval exists when `merge_right <= merge_left`.
+        let view = y_sort(vec![mk(110.0, 115.0, 200.0, 12.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 12.0, 120.0, 110.0, 200.0, 12.0, 1, 2));
+    }
+
+    #[test]
+    fn page_max_fs_widens_y_window_but_exact_check_rejects() {
+        // Partition window may admit the candidate, but the exact Y check should reject it.
+        let view = y_sort(vec![mk(112.0, 118.0, 192.0, 10.0, 7)]);
+        assert!(!would_interpose_glyph(&view, 72.0, 110.0, 120.0, 200.0, 12.0, 1, 2));
     }
 }
